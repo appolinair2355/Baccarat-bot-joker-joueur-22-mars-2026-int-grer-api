@@ -79,10 +79,10 @@ reset_done_for_cycle: bool = False
 # Compteur de prédictions (N dans le message joueur#N:game)
 prediction_counter: int = 0
 
-# ── Compteur instantané (message live dans le canal) ──────────────────────────
-counter_message_id: Optional[int] = None        # ID du message compteur dans le canal
-counter_message_last_update: Optional[datetime] = None  # Pour limiter la fréquence des éditions
-COUNTER_UPDATE_INTERVAL = 20                    # secondes minimum entre deux mises à jour
+# ── Compteur2 live — message éditable dans chaque chat admin ──────────────────
+admin_live_msg_ids: Dict[int, int] = {}         # admin_id → message_id du compteur live
+COUNTER_UPDATE_INTERVAL = 10                    # secondes minimum entre deux mises à jour
+counter_message_last_update: Optional[datetime] = None
 
 # ── Suivi des écarts (gap tracker) ───────────────────────────────────────────
 # Pour chaque costume: écart courant (parties sans apparition), historique, max
@@ -283,13 +283,14 @@ async def resolve_channel(entity_id):
 # COMPTEUR INSTANTANÉ — message live dans le canal
 # ============================================================================
 
-def build_counter_message() -> str:
-    """Construit le texte du message compteur instantané."""
-    now = datetime.now()
+def build_counter_message(game_number: int = 0) -> str:
+    """Construit le texte du compteur Compteur2 live (affiché dans les chats admin)."""
+    now = get_local_time()   # heure Bénin/Cameroun UTC+1
     reset_str = compteur2_last_reset.strftime('%H:%M') if compteur2_last_reset else "—"
     next_reset = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    jeu_str = f"Jeu #{game_number}" if game_number > 0 else "—"
     return (
-        f"📈 **Compteur instantané**\n"
+        f"📊 **Compteur2 Live — {jeu_str}**\n"
         f"♠️ : {compteur2_counts.get('♠', 0)}\n"
         f"♥️ : {compteur2_counts.get('♥', 0)}\n"
         f"♦️ : {compteur2_counts.get('♦', 0)}\n"
@@ -297,47 +298,50 @@ def build_counter_message() -> str:
         f"🔄 Reset: {reset_str} | ⏭ Prochain: {next_reset.strftime('%H:%M')}"
     )
 
-async def send_or_update_counter_message(force: bool = False):
-    """Envoie ou édite le message de compteur instantané dans le canal.
+async def update_live_counter_admins(game_number: int = 0, force: bool = False):
+    """Envoie ou édite le compteur Compteur2 live dans le chat privé de chaque admin.
 
-    - Si force=True, met à jour immédiatement (reset horaire, reset complet).
-    - Sinon, respecte l'intervalle minimum COUNTER_UPDATE_INTERVAL.
+    - Déclenché dès que le joueur finit de tirer (même si le banquier joue encore).
+    - Édite le même message à chaque mise à jour pour ne pas spammer.
+    - Si le message admin n'existe plus, en crée un nouveau.
     """
-    global counter_message_id, counter_message_last_update
+    global admin_live_msg_ids, counter_message_last_update
 
-    if not PREDICTION_CHANNEL_ID or not client or not client.is_connected():
+    if not client or not client.is_connected():
         return
 
-    # Throttle pour éviter trop d'éditions Telegram
+    # Throttle (sauf si force=True lors des resets)
     if not force and counter_message_last_update:
         elapsed = (datetime.now() - counter_message_last_update).total_seconds()
         if elapsed < COUNTER_UPDATE_INTERVAL:
             return
 
-    try:
-        prediction_entity = await resolve_channel(PREDICTION_CHANNEL_ID)
-        if not prediction_entity:
-            return
+    counter_message_last_update = datetime.now()
+    msg = build_counter_message(game_number)
 
-        msg = build_counter_message()
+    # Liste de tous les admin IDs à notifier
+    admin_ids = list(EXTRA_ADMIN_IDS)
+    if ADMIN_ID and ADMIN_ID not in admin_ids:
+        admin_ids.append(ADMIN_ID)
 
-        if counter_message_id:
-            try:
-                await client.edit_message(prediction_entity, counter_message_id, msg)
-                counter_message_last_update = datetime.now()
-                return
-            except Exception:
-                # Message supprimé ou inaccessible → en créer un nouveau
-                counter_message_id = None
+    for aid in admin_ids:
+        try:
+            msg_id = admin_live_msg_ids.get(aid)
+            if msg_id:
+                try:
+                    await client.edit_message(aid, msg_id, msg)
+                    continue
+                except Exception:
+                    # Message supprimé ou trop vieux → en envoyer un nouveau
+                    admin_live_msg_ids.pop(aid, None)
+            sent = await client.send_message(aid, msg)
+            admin_live_msg_ids[aid] = sent.id
+        except Exception as e:
+            logger.debug(f"Compteur live admin {aid}: {e}")
 
-        # Créer un nouveau message compteur
-        sent = await client.send_message(prediction_entity, msg)
-        counter_message_id = sent.id
-        counter_message_last_update = datetime.now()
-        logger.info(f"📈 Message compteur créé (ID: {counter_message_id})")
-
-    except Exception as e:
-        logger.error(f"❌ Erreur update compteur: {e}")
+async def send_or_update_counter_message(force: bool = False):
+    """Alias maintenu pour compatibilité — redirige vers update_live_counter_admins."""
+    await update_live_counter_admins(force=force)
 
 # ============================================================================
 # HISTORIQUE DES PRÉDICTIONS
@@ -404,8 +408,8 @@ def build_prediction_message(counter: int, game_number: int, suit: str, rattrapa
     return (
         f"🤖 joueur {counter}:{game_number}\n"
         f"🔰Couleur de la carte :{suit_display}\n"
-        f"🎰 Poursuite:  🔰+3 jeux\n"
-        f"🗯️ Résultats : {result}"
+        f"🔰 Rattrapages : {MAX_RATTRAPAGE}(🔰+{MAX_RATTRAPAGE})\n"
+        f"🧨 Résultats : {result}"
     )
 
 async def send_prediction(game_number: int, suit: str, triggered_by_suit: str) -> Optional[int]:
@@ -657,8 +661,8 @@ async def process_compteur2(game_number: int, player_suits: List[str], player_ca
     # --- Mettre à jour les écarts (gap tracker) ---
     update_gap_tracker(game_number, player_suits)
 
-    # --- Mettre à jour le message compteur live dans le canal ---
-    await send_or_update_counter_message()
+    # --- Mettre à jour le compteur live dans les chats admin ---
+    await update_live_counter_admins(game_number)
 
     # --- Vérifier chaque paire inverse pour le seuil BP ---
     for suit_a, suit_b in INVERSE_PAIRS:
@@ -748,25 +752,27 @@ async def process_compteur2(game_number: int, player_suits: List[str], player_ca
 
 async def hourly_reset_task():
     """Remet à zéro le Compteur2 à chaque heure pile."""
-    global compteur2_counts, compteur2_processed_games, compteur2_last_reset
+    global compteur2_counts, compteur2_processed_games, compteur2_last_reset, admin_live_msg_ids
 
     while True:
-        now = datetime.now()
+        now = get_local_time()  # heure Bénin/Cameroun UTC+1
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         wait_seconds = (next_hour - now).total_seconds()
 
-        logger.info(f"⏰ Prochain reset horaire Compteur2 dans {int(wait_seconds)}s (à {next_hour.strftime('%H:%M:%S')})")
+        logger.info(f"⏰ Prochain reset horaire Compteur2 dans {int(wait_seconds)}s (à {next_hour.strftime('%H:%M:%S')} WAT)")
         await asyncio.sleep(wait_seconds)
 
         compteur2_counts = {suit: 0 for suit in ALL_SUITS}
         compteur2_processed_games = set()
-        compteur2_last_reset = datetime.now()
+        compteur2_last_reset = get_local_time()  # heure Bénin/Cameroun UTC+1
 
         logger.info(f"⏰ Reset horaire Compteur2 effectué à {compteur2_last_reset.strftime('%H:%M:%S')}")
 
-        # Mettre à jour le message compteur live avec les valeurs remises à zéro
-        # force=True pour ignorer le throttle et afficher immédiatement le reset
-        await send_or_update_counter_message(force=True)
+        # Effacer les IDs mémorisés → envoi d'un NOUVEAU message (pas une édition)
+        admin_live_msg_ids.clear()
+
+        # Envoyer le compteur remis à zéro en tant que nouveau message dans chaque chat admin
+        await update_live_counter_admins(0, force=True)
 
 # ============================================================================
 # BOUCLE DE POLLING API - DYNAMIQUE
@@ -925,7 +931,7 @@ async def perform_full_reset(reason: str):
     global player_processed_games, player_prediction_triggered, api_results_cache
     global last_prediction_game, reset_done_for_cycle, prediction_counter
     global gap_games_processed, game_timestamps, cycle_start_time, cycle_first_game, cycle_last_game
-    global special_games_processed
+    global special_games_processed, admin_live_msg_ids
 
     stats = len(pending_predictions)
     pending_predictions.clear()
@@ -963,10 +969,13 @@ async def perform_full_reset(reason: str):
         special_tracker[cat]['gap_history_with_games'] = []
         special_tracker[cat]['total_appearances'] = 0
 
+    # Forcer un nouveau message live après reset (nouveau cycle = nouveau message)
+    admin_live_msg_ids.clear()
+
     logger.info(f"🔄 {reason} - {stats} prédictions cleared")
 
-    # Mettre à jour le message compteur live (canal uniquement — données uniquement)
-    await send_or_update_counter_message(force=True)
+    # Envoyer le compteur live remis à zéro dans les chats admin
+    await update_live_counter_admins(0, force=True)
 
     # Notifier les admins en privé (JAMAIS dans le canal de prédiction)
     now_str = get_local_time().strftime('%d/%m/%Y %H:%M')
@@ -1333,8 +1342,8 @@ async def cmd_help(event):
         "**📊 Format des prédictions:**\n"
         "🤖 joueur#N:jeu\n"
         "🔰Couleur de la carte :costume\n"
-        "🎰 Poursuite:  🔰+3 jeux\n"
-        "🗯️ Résultats : en cours ⌛ / ✅0️⃣GAGNÉ…✅3️⃣GAGNÉ / ❌PERDU\n\n"
+        "🔰 Rattrapages : 3(🔰+3)\n"
+        "🧨 Résultats : en cours ⌛ / ✅0️⃣GAGNÉ…✅3️⃣GAGNÉ / ❌PERDU\n\n"
         "**🛡️ Règles anti-spam prédictions:**\n"
         "• Écart minimum de 2 entre les numéros de jeu prédits\n"
         "• Un seul prédit à la fois (attend la vérification avant d'envoyer)\n"
