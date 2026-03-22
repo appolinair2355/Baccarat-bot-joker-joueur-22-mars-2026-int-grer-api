@@ -111,10 +111,13 @@ SPECIAL_CATEGORIES = [
 special_tracker: Dict[str, Dict] = {
     cat: {
         'current_gap': 0,
+        'last_seen_game': 0,           # numéro du dernier jeu où cette catégorie est apparue
         'historical_gaps': [],
-        'gap_history_with_games': [],  # liste de (gap_size, game_number_qui_a_clos_lecart)
+        'gap_history_with_games': [],  # liste de (gap, start_game, end_game, timestamp_WAT)
         'max_gap': 0,
         'total_appearances': 0,
+        # Costumes des cartes lors des victoires (uniquement renseigné pour 'joueur' et 'banquier')
+        'suit_counts': {'♠': 0, '♥': 0, '♦': 0, '♣': 0},
     }
     for cat in SPECIAL_CATEGORIES
 }
@@ -180,17 +183,25 @@ def baccarat_value(raw_rank) -> int:
 
 def _update_special_cat(cat: str, active: bool, game_number: int = 0):
     """Met à jour le tracker d'écart pour une catégorie spéciale.
-    Enregistre (gap_size, game_number) quand un écart se clôture.
+    Enregistre (gap, start_game, end_game, timestamp_WAT) quand un écart se clôture.
+    Gap = end_game - start_game (différence de numéros de jeu).
     """
     info = special_tracker[cat]
     if active:
-        if info['current_gap'] > 0:
-            gap = info['current_gap']
+        # Clôture d'un écart seulement si on a déjà vu cette catégorie
+        if info['last_seen_game'] > 0:
+            gap = game_number - info['last_seen_game']   # différence de numéros
+            ts  = game_timestamps.get(game_number, get_local_time())
             info['historical_gaps'].append(gap)
-            info['gap_history_with_games'].append((gap, game_number))
+            if len(info['historical_gaps']) > 500:
+                info['historical_gaps'] = info['historical_gaps'][-500:]
+            info['gap_history_with_games'].append((gap, info['last_seen_game'], game_number, ts))
+            if len(info['gap_history_with_games']) > 500:
+                info['gap_history_with_games'] = info['gap_history_with_games'][-500:]
             if gap > info['max_gap']:
                 info['max_gap'] = gap
-        info['current_gap'] = 0
+        info['current_gap']   = 0
+        info['last_seen_game'] = game_number
         info['total_appearances'] += 1
     else:
         info['current_gap'] += 1
@@ -217,6 +228,18 @@ def update_special_tracker(result: dict):
     _update_special_cat('joueur',   winner == 'Player',  game_number)
     _update_special_cat('banquier', winner == 'Banker',  game_number)
     _update_special_cat('tie',      winner == 'Tie',     game_number)
+
+    # Costumes : cartes joueur si victoire joueur, cartes banquier si victoire banquier
+    if winner == 'Player':
+        for card in player_cards:
+            s = normalize_suit(card.get('S', ''))
+            if s in special_tracker['joueur']['suit_counts']:
+                special_tracker['joueur']['suit_counts'][s] += 1
+    elif winner == 'Banker':
+        for card in banker_cards:
+            s = normalize_suit(card.get('S', ''))
+            if s in special_tracker['banquier']['suit_counts']:
+                special_tracker['banquier']['suit_counts'][s] += 1
 
     # 2. Pair / Impair (total baccarat du joueur)
     player_total = sum(baccarat_value(c.get('R', 0)) for c in player_cards) % 10
@@ -964,10 +987,12 @@ async def perform_full_reset(reason: str):
     # Réinitialiser le tracker spécial (max_gap conservé comme record global)
     special_games_processed = 0
     for cat in SPECIAL_CATEGORIES:
-        special_tracker[cat]['current_gap'] = 0
-        special_tracker[cat]['historical_gaps'] = []
+        special_tracker[cat]['current_gap']            = 0
+        special_tracker[cat]['last_seen_game']         = 0
+        special_tracker[cat]['historical_gaps']        = []
         special_tracker[cat]['gap_history_with_games'] = []
-        special_tracker[cat]['total_appearances'] = 0
+        special_tracker[cat]['total_appearances']      = 0
+        special_tracker[cat]['suit_counts']            = {'♠': 0, '♥': 0, '♦': 0, '♣': 0}
 
     # Forcer un nouveau message live après reset (nouveau cycle = nouveau message)
     admin_live_msg_ids.clear()
@@ -1481,6 +1506,24 @@ def build_rapport_special() -> str:
             bar = "🟩" * bar_f + "⬜" * (15 - bar_f)
             lines.append(f"  📊 {app} fois | {pct}% | {bar}")
 
+            # Costumes des cartes (joueur et banquier uniquement)
+            if cat in ('joueur', 'banquier') and app > 0:
+                sc = info['suit_counts']
+                total_suits = sum(sc.values())
+                SUIT_EMO = {'♠': '♠️', '♥': '❤️', '♦': '♦️', '♣': '♣️'}
+                suit_parts = []
+                for s in ['♠', '♥', '♦', '♣']:
+                    cnt = sc.get(s, 0)
+                    p = round(cnt / total_suits * 100, 1) if total_suits > 0 else 0
+                    suit_parts.append(f"{SUIT_EMO[s]}{cnt}({p}%)")
+                lines.append(f"  🎴 Costumes: {' | '.join(suit_parts)}")
+                # Costume dominant et rare
+                if total_suits > 0:
+                    dom = max(sc, key=sc.get)
+                    rare = min(sc, key=sc.get)
+                    if sc[dom] != sc[rare]:
+                        lines.append(f"  ↑ Dominant: {SUIT_EMO[dom]}  ↓ Rare: {SUIT_EMO[rare]}")
+
             # Écart courant
             if cur_gap > 0:
                 if cur_gap > MAX_GAP_SPECIAL:
@@ -1499,6 +1542,26 @@ def build_rapport_special() -> str:
 
             if hist_faux:
                 lines.append(f"  🚫 Faux chiffres (>{MAX_GAP_SPECIAL}): {', '.join(str(g) for g in sorted(hist_faux, reverse=True)[:5])}")
+
+            # Top 10 écarts MAX + top 11-20 (triés par taille décroissante)
+            ghist = info['gap_history_with_games']
+            if ghist:
+                sorted_gaps = sorted(ghist, key=lambda x: x[0], reverse=True)
+                top10  = sorted_gaps[:10]
+                top20  = sorted_gaps[10:20]
+
+                lines.append(f"  🏆 Top 10 écarts MAX:")
+                for gap_v, sg, eg, ts in top10:
+                    heure = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else '—'
+                    flag  = ' ⚠️' if gap_v > MAX_GAP_SPECIAL else ''
+                    lines.append(f"    #{sg}→#{eg}  écart {gap_v}{flag}  [{heure}]")
+
+                if top20:
+                    lines.append(f"  📋 Top 11→20 écarts MAX:")
+                    for gap_v, sg, eg, ts in top20:
+                        heure = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else '—'
+                        flag  = ' ⚠️' if gap_v > MAX_GAP_SPECIAL else ''
+                        lines.append(f"    #{sg}→#{eg}  écart {gap_v}{flag}  [{heure}]")
 
         lines.append("")
 
@@ -2337,48 +2400,55 @@ def generate_special_pdf(path: str):
         '2k':'2K (joueur)','3k':'3K (joueur)',
         '3_2':'3K/2K','3_3':'3K/3K','2_3':'2K/3K','2_2':'2K/2K',
     }
+    # all_gaps : (gap, sg, eg, ts, label, statut)
     all_gaps = []
     for cat in SPECIAL_CATEGORIES:
         info = special_tracker[cat]
         label = LABELS_SHORT.get(cat, cat)
         # Écarts historiques clôturés
-        for gap, g_num in info['gap_history_with_games']:
-            all_gaps.append((gap, g_num, label, 'Clos'))
+        for gap, sg, eg, ts in info['gap_history_with_games']:
+            all_gaps.append((gap, sg, eg, ts, label, 'Clos'))
         # Écart courant non encore clôturé
         if info['current_gap'] > 0:
-            all_gaps.append((info['current_gap'], 0, label, 'En cours'))
+            all_gaps.append((info['current_gap'], info['last_seen_game'], 0, None, label, 'En cours'))
 
     # Trier par écart décroissant, prendre top 10
     top10 = sorted(all_gaps, key=lambda x: x[0], reverse=True)[:10]
 
-    # ── Tableau ──────────────────────────────────────────────────────────────
-    COL_W = [12, 60, 28, 35, 55]   # Rang | Catégorie | Écart | Partie # | Statut
-    HEADERS = ['Rang', 'Categorie', 'Ecart', 'Partie #', 'Statut']
+    # ── Tableau Top-10 ───────────────────────────────────────────────────────
+    # Rang(10) | Catégorie(47) | Écart(18) | #Début→#Fin(43) | Heure(22) | Statut(50)
+    COL_W = [10, 47, 18, 43, 22, 50]
+    HEADERS = ['Rang', 'Categorie', 'Ecart', '#Debut -> #Fin', 'Heure', 'Statut']
 
     def table_header_row():
         pdf.set_fill_color(*C_HEAD)
         pdf.set_text_color(*C_WHITE)
-        pdf.set_font('Helvetica', 'B', 10)
+        pdf.set_font('Helvetica', 'B', 9)
         for i, h in enumerate(HEADERS):
             pdf.cell(COL_W[i], 9, h, border=1, fill=True, align='C')
         pdf.ln()
 
-    def table_data_row(rank: int, gap: int, g_num: int, label: str, statut: str):
+    def table_data_row(rank: int, gap: int, sg: int, eg: int, ts, label: str, statut: str):
         is_faux = gap > MAX_GAP_SPECIAL
         bg = (255, 230, 230) if is_faux else (C_LIGHT if rank % 2 == 0 else C_WHITE)
         pdf.set_fill_color(*bg)
         pdf.set_text_color(*(C_RED if is_faux else C_DARK))
-        pdf.set_font('Helvetica', 'B' if rank == 1 else '', 10)
+        pdf.set_font('Helvetica', 'B' if rank == 1 else '', 9)
 
-        part_str = f'#{g_num}' if g_num > 0 else 'En cours'
-        faux_mark = '  [FAUX]' if is_faux else ''
+        if eg > 0:
+            range_str = f'#{sg} -> #{eg}' if sg > 0 else f'-> #{eg}'
+        else:
+            range_str = f'#{sg} -> ?' if sg > 0 else 'En cours'
+        heure_str = ts.strftime('%H:%M') if ts and hasattr(ts, 'strftime') else '-'
+        faux_mark = ' [FAUX]' if is_faux else ''
         statut_str = f'{statut}{faux_mark}'
 
-        pdf.cell(COL_W[0], 8, str(rank), border=1, fill=True, align='C')
-        pdf.cell(COL_W[1], 8, label, border=1, fill=True)
-        pdf.cell(COL_W[2], 8, str(gap), border=1, fill=True, align='C')
-        pdf.cell(COL_W[3], 8, part_str, border=1, fill=True, align='C')
-        pdf.cell(COL_W[4], 8, statut_str, border=1, fill=True, align='C')
+        pdf.cell(COL_W[0], 8, str(rank),          border=1, fill=True, align='C')
+        pdf.cell(COL_W[1], 8, safe(label),        border=1, fill=True)
+        pdf.cell(COL_W[2], 8, str(gap),           border=1, fill=True, align='C')
+        pdf.cell(COL_W[3], 8, safe(range_str),    border=1, fill=True, align='C')
+        pdf.cell(COL_W[4], 8, safe(heure_str),    border=1, fill=True, align='C')
+        pdf.cell(COL_W[5], 8, safe(statut_str),   border=1, fill=True, align='C')
         pdf.ln()
 
     if not top10:
@@ -2388,12 +2458,12 @@ def generate_special_pdf(path: str):
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     else:
         table_header_row()
-        for rank, (gap, g_num, label, statut) in enumerate(top10, 1):
-            table_data_row(rank, gap, g_num, label, statut)
+        for rank, (gap, sg, eg, ts, label, statut) in enumerate(top10, 1):
+            table_data_row(rank, gap, sg, eg, ts, label, statut)
         pdf.ln(6)
 
         # Note faux chiffres
-        nb_faux = sum(1 for g, _, _, _ in top10 if g > MAX_GAP_SPECIAL)
+        nb_faux = sum(1 for row in top10 if row[0] > MAX_GAP_SPECIAL)
         if nb_faux > 0:
             pdf.set_font('Helvetica', 'I', 9)
             pdf.set_text_color(*C_RED)
@@ -2426,11 +2496,11 @@ def generate_special_pdf(path: str):
             label = LABELS_SHORT.get(cat, cat)
             mx = info['max_gap']
             cur = info['current_gap']
-            # Trouver le numéro de jeu du max
+            # Trouver le numéro de jeu de clôture du max
             mx_game = 0
-            for gap, g_num in info['gap_history_with_games']:
+            for gap, sg, eg, ts in info['gap_history_with_games']:
                 if gap == mx and mx > 0:
-                    mx_game = g_num
+                    mx_game = eg
                     break
             mx_part = f'#{mx_game}' if mx_game > 0 else ('En cours' if cur == mx and cur > 0 else 'N/A')
 
@@ -2454,6 +2524,130 @@ def generate_special_pdf(path: str):
             pdf.set_text_color(*C_DARK)
             pdf.cell(COL_W2[3], 7, cur_str, border=1, fill=True)
             pdf.ln()
+
+    # ── Section : Costumes lors des victoires (Joueur & Banquier) ────────────
+    SUIT_ORDER = ['♠', '♥', '♦', '♣']
+    SUIT_LABELS_PDF = {'♠': 'PIQUE', '♥': 'COEUR', '♦': 'CARREAU', '♣': 'TREFLE'}
+    for cat_suit, cat_label_suit in [('joueur', 'VICTOIRE JOUEUR'), ('banquier', 'VICTOIRE BANQUIER')]:
+        sc = special_tracker[cat_suit]['suit_counts']
+        total_s = sum(sc.values())
+        if total_s == 0:
+            continue
+        pdf.ln(4)
+        pdf.set_fill_color(*C_HEAD)
+        pdf.set_text_color(*C_WHITE)
+        pdf.set_font('Helvetica', 'B', 10)
+        pdf.cell(0, 8, f'  Costumes des cartes  -  {cat_label_suit}',
+                 fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # Colonnes : Costume(47) | Nb cartes(30) | %(30) | Barre(83)
+        CWS = [47, 30, 30, 83]
+        pdf.set_fill_color(*C_HEAD)
+        pdf.set_text_color(*C_WHITE)
+        pdf.set_font('Helvetica', 'B', 9)
+        for h, w in zip(['Costume', 'Nb cartes', '%', 'Barre'], CWS):
+            pdf.cell(w, 7, h, border=1, fill=True, align='C')
+        pdf.ln()
+        for ridx, s in enumerate(SUIT_ORDER):
+            cnt = sc.get(s, 0)
+            pct_s = round(cnt / total_s * 100, 1) if total_s > 0 else 0
+            bar_l = round(pct_s / 100 * 20)
+            bar_s = '#' * bar_l + '.' * (20 - bar_l)
+            dom_s = max(sc, key=sc.get)
+            is_dom = (s == dom_s)
+            bg = (220, 255, 220) if is_dom else (C_LIGHT if ridx % 2 == 0 else C_WHITE)
+            pdf.set_fill_color(*bg)
+            pdf.set_text_color(*C_DARK)
+            pdf.set_font('Helvetica', 'B' if is_dom else '', 9)
+            pdf.cell(CWS[0], 7, safe(f'{s}  {SUIT_LABELS_PDF[s]}'), border=1, fill=True)
+            pdf.cell(CWS[1], 7, safe(str(cnt)), border=1, fill=True, align='C')
+            pdf.cell(CWS[2], 7, safe(f'{pct_s}%'), border=1, fill=True, align='C')
+            pdf.cell(CWS[3], 7, safe(bar_s), border=1, fill=True)
+            pdf.ln()
+
+    # ── Section : 10 derniers écarts par catégorie ───────────────────────────
+    # Colonnes : #Début(30) | #Fin(30) | Écart(22) | Heure(25) | Statut(83)
+    CW3 = [30, 30, 22, 25, 83]
+    HH3 = ['#Debut', '#Fin', 'Ecart', 'Heure', 'Statut']
+
+    has_any_hist = any(len(special_tracker[c]['gap_history_with_games']) > 0 for c in SPECIAL_CATEGORIES)
+    if has_any_hist:
+        pdf.add_page()
+        pdf.set_fill_color(*C_HEAD)
+        pdf.set_text_color(*C_WHITE)
+        pdf.set_font('Helvetica', 'B', 12)
+        pdf.cell(0, 9, '  10 DERNIERS ECARTS PAR CATEGORIE  (du + recent au + ancien)',
+                 fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(4)
+
+        for cat in SPECIAL_CATEGORIES:
+            info = special_tracker[cat]
+            ghist = info['gap_history_with_games']
+            label = LABELS_SHORT.get(cat, cat)
+            if not ghist:
+                continue
+
+            # En-tête catégorie
+            pdf.set_fill_color(*(200, 220, 255))
+            pdf.set_text_color(*C_DARK)
+            pdf.set_font('Helvetica', 'B', 10)
+            pdf.cell(0, 7, safe(f'  {label}  ({len(ghist)} ecart(s) enregistre(s))'),
+                     border=1, fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            # En-tête colonnes
+            pdf.set_fill_color(*C_HEAD)
+            pdf.set_text_color(*C_WHITE)
+            pdf.set_font('Helvetica', 'B', 8)
+            for i, h in enumerate(HH3):
+                pdf.cell(CW3[i], 7, h, border=1, fill=True, align='C')
+            pdf.ln()
+
+            # ── Tri par taille décroissante : Top 10 MAX + Top 11-20 ────────
+            sorted_g = sorted(ghist, key=lambda x: x[0], reverse=True)
+            top10_pdf = sorted_g[:10]
+            top20_pdf = sorted_g[10:20]
+
+            def _pdf_gap_row(ridx_r, gap_v, sg, eg, ts, alt=False):
+                is_faux = gap_v > MAX_GAP_SPECIAL
+                if is_faux:
+                    bg = (255, 210, 210)
+                elif alt:
+                    bg = (230, 240, 255)
+                else:
+                    bg = (C_LIGHT if ridx_r % 2 == 0 else C_WHITE)
+                pdf.set_fill_color(*bg)
+                pdf.set_text_color(*(C_RED if is_faux else C_DARK))
+                pdf.set_font('Helvetica', '', 8)
+                heure_str  = ts.strftime('%H:%M') if ts and hasattr(ts, 'strftime') else '-'
+                statut_str = 'FAUX [>' + str(MAX_GAP_SPECIAL) + ']' if is_faux else 'Valide'
+                pdf.cell(CW3[0], 6, safe(f'#{sg}'),      border=1, fill=True, align='C')
+                pdf.cell(CW3[1], 6, safe(f'#{eg}'),      border=1, fill=True, align='C')
+                pdf.cell(CW3[2], 6, safe(str(gap_v)),    border=1, fill=True, align='C')
+                pdf.cell(CW3[3], 6, safe(heure_str),     border=1, fill=True, align='C')
+                pdf.cell(CW3[4], 6, safe(statut_str),    border=1, fill=True, align='C')
+                pdf.ln()
+
+            # Séparateur "Top 10 MAX"
+            pdf.set_fill_color(*(40, 80, 160))
+            pdf.set_text_color(*C_WHITE)
+            pdf.set_font('Helvetica', 'B', 7)
+            for h, w in zip(['', '', '', '', 'TOP 10 ECARTS MAX (du + grand)'], CW3):
+                pdf.cell(w, 5, safe(h), border=1, fill=True, align='C')
+            pdf.ln()
+            for ridx, (gap_v, sg, eg, ts) in enumerate(top10_pdf):
+                _pdf_gap_row(ridx, gap_v, sg, eg, ts, alt=False)
+
+            # Séparateur + Top 11-20
+            if top20_pdf:
+                pdf.set_fill_color(*(100, 140, 200))
+                pdf.set_text_color(*C_WHITE)
+                pdf.set_font('Helvetica', 'B', 7)
+                for h, w in zip(['', '', '', '', 'TOP 11 -> 20 ECARTS MAX'], CW3):
+                    pdf.cell(w, 5, safe(h), border=1, fill=True, align='C')
+                pdf.ln()
+                for ridx, (gap_v, sg, eg, ts) in enumerate(top20_pdf):
+                    _pdf_gap_row(ridx, gap_v, sg, eg, ts, alt=True)
+
+            pdf.ln(4)
 
     # ── Pied de page (toutes les pages) ──────────────────────────────────────
     pdf.set_y(-20)
