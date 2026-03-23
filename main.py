@@ -76,7 +76,10 @@ player_prediction_triggered: set = set()
 # Pour éviter de déclencher le reset plusieurs fois pour la partie 1440
 reset_done_for_cycle: bool = False
 
-# Compteur de prédictions (N dans le message joueur#N:game)
+# Pour éviter d'envoyer les rapports #1440 avant que la partie soit entièrement terminée
+reports_sent_for_1440: bool = False
+
+# Compteur de prédictions (numéro interne, utilisé dans l'historique admin)
 prediction_counter: int = 0
 
 # ── Compteur2 live — message éditable dans chaque chat admin ──────────────────
@@ -429,7 +432,7 @@ def build_prediction_message(counter: int, game_number: int, suit: str, rattrapa
     """Construit le message de prédiction au format unifié."""
     suit_display = SUIT_DISPLAY.get(suit, suit)
     return (
-        f"🤖 joueur {counter}:{game_number}\n"
+        f"🤖 joueur :{game_number}\n"
         f"🔰Couleur de la carte :{suit_display}\n"
         f"🔰 Rattrapages : {MAX_RATTRAPAGE}(🔰+{MAX_RATTRAPAGE})\n"
         f"🧨 Résultats : {result}"
@@ -829,7 +832,7 @@ async def api_polling_loop():
     - Reset automatique : déclenché quand la partie #1440 est terminée.
     """
     global current_game_number, api_results_cache, player_processed_games
-    global reset_done_for_cycle, player_prediction_triggered
+    global reset_done_for_cycle, reports_sent_for_1440, player_prediction_triggered
 
     loop = asyncio.get_event_loop()
     logger.info(f"🔄 Polling API dynamique démarré (intervalle: {API_POLL_INTERVAL}s)")
@@ -882,19 +885,22 @@ async def api_polling_loop():
                         # ── ENVOI ET RESET AUTOMATIQUE — PARTIE #1440 ───────────
                         # Dès que le JOUEUR a terminé de tirer ses cartes sur la partie #1440,
                         # on envoie les rapports et on repart sur un nouveau cycle.
+                        # On n'attend PAS le banquier : le numéro de jeu est connu dès que
+                        # le joueur a fini ses cartes.
                         if game_number == 1440 and not reset_done_for_cycle:
                             reset_done_for_cycle = True
-                            logger.info("🔔 Partie #1440 côté joueur terminée — envoi rapports automatiques")
+                            reports_sent_for_1440 = True
+                            logger.info("🔔 Partie #1440 côté joueur terminée — envoi de tous les rapports automatiques")
 
-                            # Tenter d'inclure #1440 dans le tracker spécial si résultat disponible
-                            if (result.get('winner') is not None
-                                    and len(result.get('banker_cards', [])) >= 2
-                                    and game_number not in player_processed_games):
-                                player_processed_games.add(game_number)
-                                update_special_tracker(result)
-                                logger.info("📊 Tracker spécial #1440 mis à jour avant rapport")
+                            # ── 1. Rapport spécial (texte) ───────────────────────
+                            try:
+                                special_msg = build_rapport_special()
+                                await send_rapport_to_admins(special_msg)
+                                logger.info("🃏 Rapport spécial texte #1440 envoyé aux admins")
+                            except Exception as e:
+                                logger.error(f"❌ Erreur rapport spécial texte #1440: {e}")
 
-                            # ── Rapport journalier détaillé ──────────────────────
+                            # ── 2. Rapport journalier détaillé (bilan complet) ───
                             try:
                                 daily_msg = build_daily_rapport_1440()
                                 await send_rapport_to_admins(daily_msg)
@@ -902,7 +908,7 @@ async def api_polling_loop():
                             except Exception as e:
                                 logger.error(f"❌ Erreur rapport journalier #1440: {e}")
 
-                            # ── Rapport spécial PDF ──────────────────────────────
+                            # ── 3. Rapport spécial PDF ───────────────────────────
                             try:
                                 await send_special_pdf_to_admins()
                                 logger.info("📄 Rapport spécial PDF #1440 envoyé aux admins")
@@ -914,7 +920,6 @@ async def api_polling_loop():
 
                     # ── TRACKER SPÉCIAL ─────────────────────────────────────────
                     # Nécessite banker_cards + winner → attend que la partie soit entièrement terminée.
-                    # (Pour #1440 : déjà traité ci-dessus si données disponibles au bon moment.)
                     if game_number not in player_processed_games and is_finished:
                         player_processed_games.add(game_number)
                         if len(player_processed_games) > 500:
@@ -952,7 +957,7 @@ async def perform_full_reset(reason: str):
     global compteur2_counts, compteur2_last_game
     global compteur2_processed_games
     global player_processed_games, player_prediction_triggered, api_results_cache
-    global last_prediction_game, reset_done_for_cycle, prediction_counter
+    global last_prediction_game, reset_done_for_cycle, reports_sent_for_1440, prediction_counter
     global gap_games_processed, game_timestamps, cycle_start_time, cycle_first_game, cycle_last_game
     global special_games_processed, admin_live_msg_ids
 
@@ -967,6 +972,7 @@ async def perform_full_reset(reason: str):
     player_prediction_triggered = set()
     api_results_cache = {}
     prediction_counter = 0
+    reports_sent_for_1440 = False
 
     # Réinitialiser le gap tracker pour le nouveau cycle
     # On conserve max_gap (record historique global) mais on repart de zéro pour ce cycle
@@ -1365,7 +1371,7 @@ async def cmd_help(event):
         "• Déblocage auto si une autre costume est prédite entre-temps\n"
         "• Déblocage auto si 30+ min sans prédiction dans le cycle\n\n"
         "**📊 Format des prédictions:**\n"
-        "🤖 joueur#N:jeu\n"
+        "🤖 joueur :numéro prédit\n"
         "🔰Couleur de la carte :costume\n"
         "🔰 Rattrapages : 3(🔰+3)\n"
         "🧨 Résultats : en cours ⌛ / ✅0️⃣GAGNÉ…✅3️⃣GAGNÉ / ❌PERDU\n\n"
@@ -1394,7 +1400,8 @@ async def cmd_help(event):
         "`/announce <msg>` — Annonce\n"
         "`/raison [N]` — Raison de la prédiction N (ou dernière)\n"
         "`/manquants` — Costumes manquants et écarts historiques\n"
-        "`/rapport [minutes|now]` — Rapports auto périodiques\n"
+        "`/rapport [minutes|now|details|1440]` — Rapports auto et sur demande\n"
+        "`/special` — Rapport spécial PDF (victoires, pair/impair, combinaisons)\n"
         "`/help` — Cette aide"
     )
 
@@ -2122,12 +2129,14 @@ async def cmd_rapport(event):
             f"Dernier rapport envoyé: {last}\n\n"
             f"**Commandes disponibles:**\n"
             f"`/rapport <N>` — Rapport simple toutes les N min (ex: 60)\n"
-            f"`/rapport 0` — Désactiver\n"
+            f"`/rapport 0` — Désactiver le rapport automatique\n"
             f"`/rapport now` — Rapport simple maintenant\n"
             f"`/rapport details` — Rapport détaillé complet maintenant\n"
-            f"`/rapport 1440` — Rapport journalier (fin de cycle) maintenant\n\n"
-            f"ℹ️ Le rapport simple = chiffres globaux rapides\n"
-            f"ℹ️ Le rapport détaillé = analyse complète avec conseils"
+            f"`/rapport 1440` — Rapport journalier (fin de cycle) maintenant\n"
+            f"`/special` — Rapport spécial PDF (victoires, pair/impair, combinaisons)\n\n"
+            f"ℹ️ Rapport simple = chiffres globaux rapides (envoyé automatiquement si intervalle défini)\n"
+            f"ℹ️ Rapport détaillé = analyse complète avec conseils (sur demande)\n"
+            f"ℹ️ Rapport spécial = victoires/pair/impair/combinaisons en PDF (sur demande ou auto au #1440)"
         )
         return
 
